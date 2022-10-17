@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
@@ -15,12 +16,21 @@ import com.db.awmd.challenge.domain.TransferRequest;
 import com.db.awmd.challenge.exception.AccountNotFoundException;
 import com.db.awmd.challenge.exception.InsufficientBalanceException;
 import java.math.BigDecimal;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+@Slf4j
 @ExtendWith(MockitoExtension.class)
 class FundsTransferServiceTest {
 
@@ -88,5 +98,58 @@ class FundsTransferServiceTest {
         verify(notificationService).notifyAboutTransfer(eq(fromAccount), anyString());
         verify(notificationService).notifyAboutTransfer(eq(toAccount), anyString());
         verifyNoMoreInteractions(notificationService);
+    }
+
+    @Test
+    void transferFounds_whenNoIssuesConcurrently_thenFoundsTransferred() throws InterruptedException {
+        BigDecimal initialSum = BigDecimal.TEN;
+        Account firstAccount = new Account(FROM_ACCOUNT_ID, initialSum);
+        Account secondAccount = new Account(TO_ACCOUNT_ID, initialSum);
+        when(accountsService.getAccount(FROM_ACCOUNT_ID))
+            .thenReturn(firstAccount);
+        when(accountsService.getAccount(TO_ACCOUNT_ID))
+            .thenReturn(secondAccount);
+
+        List<TransferRequest> transferRequests = generateTransferRequests();
+        int transferRequestsAmount = transferRequests.size();
+        CountDownLatch countDownLatch = new CountDownLatch(transferRequestsAmount);
+
+        Stream.ofNullable(transferRequests)
+            .flatMap(Collection::stream)
+            .map(tr -> new Worker(() -> fundsTransferService.transferFounds(tr), countDownLatch))
+            .map(Thread::new)
+            .forEach(Thread::start);
+        countDownLatch.await();
+
+        assertEquals(initialSum, firstAccount.getBalance());
+        assertEquals(initialSum, secondAccount.getBalance());
+        verify(accountsService, times(transferRequestsAmount)).getAccount(FROM_ACCOUNT_ID);
+        verify(accountsService, times(transferRequestsAmount)).getAccount(TO_ACCOUNT_ID);
+        verifyNoMoreInteractions(accountsService);
+        verify(notificationService, times(transferRequestsAmount)).notifyAboutTransfer(eq(firstAccount), anyString());
+        verify(notificationService, times(transferRequestsAmount)).notifyAboutTransfer(eq(secondAccount), anyString());
+        verifyNoMoreInteractions(notificationService);
+    }
+
+    private List<TransferRequest> generateTransferRequests() {
+        return IntStream.range(0, 10)
+            .mapToObj(i -> i % 2 == 0
+                ? new TransferRequest(FROM_ACCOUNT_ID, TO_ACCOUNT_ID, BigDecimal.ONE)
+                : new TransferRequest(TO_ACCOUNT_ID, FROM_ACCOUNT_ID, BigDecimal.ONE))
+            .collect(Collectors.toList());
+    }
+
+    @RequiredArgsConstructor
+    private static class Worker implements Runnable {
+
+        private final Runnable runnable;
+        private final CountDownLatch countDownLatch;
+
+        @Override
+        public void run() {
+            runnable.run();
+            log.info("Counted down. Thread: {}", Thread.currentThread().getName());
+            countDownLatch.countDown();
+        }
     }
 }
